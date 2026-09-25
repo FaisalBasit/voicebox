@@ -1,17 +1,30 @@
 import {
+  Check,
   Copy,
+  GalleryVerticalEnd,
   GripHorizontal,
   Minus,
   Pause,
   Play,
   Plus,
+  RotateCcw,
   Scissors,
   Square,
   Trash2,
+  Volume2,
+  VolumeX,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import WaveSurfer from 'wavesurfer.js';
 import { Button } from '@/components/ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { Slider } from '@/components/ui/slider';
 import { useToast } from '@/components/ui/use-toast';
 import { apiClient } from '@/lib/api/client';
 import type { StoryItemDetail } from '@/lib/api/types';
@@ -19,21 +32,26 @@ import {
   useDuplicateStoryItem,
   useMoveStoryItem,
   useRemoveStoryItem,
+  useSetStoryItemVersion,
   useSplitStoryItem,
   useTrimStoryItem,
+  useUpdateStoryItemVolume,
 } from '@/lib/hooks/useStories';
 import { cn } from '@/lib/utils/cn';
+import { useGenerationStore } from '@/stores/generationStore';
 import { useStoryStore } from '@/stores/storyStore';
 
 // Clip waveform component with trim support
 function ClipWaveform({
   generationId,
+  versionId,
   width,
   trimStartMs,
   trimEndMs,
   duration,
 }: {
   generationId: string;
+  versionId?: string;
   width: number;
   trimStartMs: number;
   trimEndMs: number;
@@ -64,8 +82,19 @@ function ClipWaveform({
 
     const waveColor = getCSSVar('--accent-foreground');
 
+    // Hand WaveSurfer a muted <audio> element so the MediaElement backend
+    // can never bleed audio. Web Audio is doing the actual playback in
+    // useStoryPlayback; this clip waveform exists purely for the visual.
+    // Without this, long imported clips (MP3 / M4A) end up audible from
+    // wavesurfer's own element on top of the timeline, and that element
+    // doesn't get paused by stopAllSources().
+    const mediaElement = document.createElement('audio');
+    mediaElement.muted = true;
+    mediaElement.preload = 'metadata';
+
     const wavesurfer = WaveSurfer.create({
       container: waveformRef.current,
+      media: mediaElement,
       waveColor,
       progressColor: waveColor,
       cursorWidth: 0,
@@ -79,7 +108,9 @@ function ClipWaveform({
 
     wavesurferRef.current = wavesurfer;
 
-    const audioUrl = apiClient.getAudioUrl(generationId);
+    const audioUrl = versionId
+      ? apiClient.getVersionAudioUrl(versionId)
+      : apiClient.getAudioUrl(generationId);
     wavesurfer.load(audioUrl).catch(() => {
       // Ignore load errors
     });
@@ -88,7 +119,7 @@ function ClipWaveform({
       wavesurfer.destroy();
       wavesurferRef.current = null;
     };
-  }, [generationId, fullWaveformWidth]);
+  }, [generationId, versionId, fullWaveformWidth]);
 
   return (
     <div className="w-full h-full opacity-60 overflow-hidden">
@@ -105,6 +136,66 @@ function ClipWaveform({
   );
 }
 
+// Per-clip volume popover. Local state drives the slider during a drag so
+// each pointer-move pixel doesn't fire a PATCH; commits on release.
+function ClipVolumePopover({
+  storyId,
+  itemId,
+  volume,
+  onChange,
+}: {
+  storyId: string;
+  itemId: string;
+  volume: number;
+  onChange: (value: number) => void;
+}) {
+  const [localVolume, setLocalVolume] = useState(volume);
+  // Re-sync when the selected clip changes or the persisted value updates
+  // out-of-band (split/duplicate carry the value forward).
+  useEffect(() => {
+    setLocalVolume(volume);
+  }, [volume, itemId, storyId]);
+
+  const display = Math.round(localVolume * 100);
+  const Icon = localVolume === 0 ? VolumeX : Volume2;
+
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7"
+          title={`Volume — ${display}%`}
+          aria-label="Adjust clip volume"
+        >
+          <Icon className="h-4 w-4" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="center" className="w-56 p-3">
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-xs text-muted-foreground">Volume</span>
+          <span className="text-xs tabular-nums">{display}%</span>
+        </div>
+        <Slider
+          value={[localVolume * 100]}
+          onValueChange={([v]) => setLocalVolume(v / 100)}
+          onValueCommit={([v]) => onChange(v / 100)}
+          min={0}
+          max={200}
+          step={1}
+          aria-label="Clip volume"
+        />
+        <div className="flex justify-between mt-2 text-[10px] text-muted-foreground tabular-nums">
+          <span>0%</span>
+          <span>100%</span>
+          <span>200%</span>
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 interface StoryTrackEditorProps {
   storyId: string;
   items: StoryItemDetail[];
@@ -112,15 +203,21 @@ interface StoryTrackEditorProps {
 
 const TRACK_HEIGHT = 48;
 const TIME_RULER_HEIGHT = 24; // h-6 = 1.5rem = 24px
-const MIN_PIXELS_PER_SECOND = 10;
-const MAX_PIXELS_PER_SECOND = 200;
-const DEFAULT_PIXELS_PER_SECOND = 50;
+const SCRUB_BAR_HEIGHT = 16;
+const LABEL_COL_WIDTH = 64; // w-16 = 4rem = 64px
+// Zoom is expressed to the user as how many seconds of timeline are visible
+// at once. Min scope = the most you can zoom IN; max scope = the entire
+// project. Default scope is what we land on when the editor first measures.
+const MIN_VISIBLE_SECONDS = 10;
+const DEFAULT_VISIBLE_SECONDS = 60;
+const FALLBACK_PIXELS_PER_SECOND = 50; // used until containerWidth is measured
 const DEFAULT_TRACKS = [1, 0, -1]; // Default 3 tracks
 const MIN_EDITOR_HEIGHT = 120;
 const MAX_EDITOR_HEIGHT = 500;
 
 export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
-  const [pixelsPerSecond, setPixelsPerSecond] = useState(DEFAULT_PIXELS_PER_SECOND);
+  const [pixelsPerSecond, setPixelsPerSecond] = useState(FALLBACK_PIXELS_PER_SECOND);
+  const hasAppliedDefaultZoomRef = useRef(false);
   const [draggingItem, setDraggingItem] = useState<string | null>(null);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const [dragPosition, setDragPosition] = useState({ x: 0, y: 0 });
@@ -135,11 +232,62 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
   const splitItem = useSplitStoryItem();
   const duplicateItem = useDuplicateStoryItem();
   const removeItem = useRemoveStoryItem();
+  const setItemVersion = useSetStoryItemVersion();
+  const updateVolume = useUpdateStoryItemVolume();
   const { toast } = useToast();
+  const addPendingGeneration = useGenerationStore((s) => s.addPendingGeneration);
+  // User-added empty tracks. Live in component state because a track only
+  // earns its keep once a clip lands on it — no need to persist an unused
+  // row across reloads.
+  const [extraTracks, setExtraTracks] = useState<number[]>([]);
 
   // Selection state
   const selectedClipId = useStoryStore((state) => state.selectedClipId);
   const setSelectedClipId = useStoryStore((state) => state.setSelectedClipId);
+
+  // Selected clip item (for version picker)
+  const selectedItem = useMemo(
+    () => (selectedClipId ? items.find((i) => i.id === selectedClipId) : undefined),
+    [selectedClipId, items],
+  );
+  const selectedItemVersions = selectedItem?.versions;
+  const hasMultipleVersions = selectedItemVersions && selectedItemVersions.length > 1;
+
+  // Determine which version label is active for the selected clip
+  const activeVersionLabel = useMemo(() => {
+    if (!selectedItem || !selectedItemVersions) return null;
+    // If the item has a pinned version_id, find its label
+    if (selectedItem.version_id) {
+      const pinned = selectedItemVersions.find((v) => v.id === selectedItem.version_id);
+      return pinned?.label ?? null;
+    }
+    // Otherwise use the generation's default version
+    const defaultVersion = selectedItemVersions.find((v) => v.is_default);
+    return defaultVersion?.label ?? null;
+  }, [selectedItem, selectedItemVersions]);
+
+  const handleSetVersion = useCallback(
+    (versionId: string | null) => {
+      if (!selectedClipId) return;
+      setItemVersion.mutate(
+        {
+          storyId,
+          itemId: selectedClipId,
+          data: { version_id: versionId },
+        },
+        {
+          onError: (error) => {
+            toast({
+              title: 'Failed to set version',
+              description: error instanceof Error ? error.message : String(error),
+              variant: 'destructive',
+            });
+          },
+        },
+      );
+    },
+    [selectedClipId, storyId, setItemVersion, toast],
+  );
 
   // Trim state
   const [trimmingItem, setTrimmingItem] = useState<string | null>(null);
@@ -200,10 +348,32 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
     stop();
   };
 
-  // Calculate unique tracks from items, always showing at least 3 default tracks
+  // Calculate unique tracks from items, always showing at least 3 default
+  // tracks. ``extraTracks`` lets the user open a fresh row without first
+  // having to drag a clip there.
   const tracks = useMemo(() => {
-    const trackSet = new Set([...DEFAULT_TRACKS, ...items.map((item) => item.track)]);
+    const trackSet = new Set([
+      ...DEFAULT_TRACKS,
+      ...items.map((item) => item.track),
+      ...extraTracks,
+    ]);
     return Array.from(trackSet).sort((a, b) => b - a); // Higher tracks on top
+  }, [items, extraTracks]);
+
+  const handleAddTrackAbove = useCallback(() => {
+    setExtraTracks((prev) => {
+      const all = new Set([...DEFAULT_TRACKS, ...items.map((i) => i.track), ...prev]);
+      const next = (all.size > 0 ? Math.max(...all) : 0) + 1;
+      return [...prev, next];
+    });
+  }, [items]);
+
+  const handleAddTrackBelow = useCallback(() => {
+    setExtraTracks((prev) => {
+      const all = new Set([...DEFAULT_TRACKS, ...items.map((i) => i.track), ...prev]);
+      const next = (all.size > 0 ? Math.min(...all) : 0) - 1;
+      return [...prev, next];
+    });
   }, [items]);
 
   // Track container width for full-width minimum
@@ -224,6 +394,44 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
     return () => observer.disconnect();
   }, []);
 
+  // Horizontal scrollbar state
+  const [timelineScrollLeft, setTimelineScrollLeft] = useState(0);
+  const [scrollbarTrackWidth, setScrollbarTrackWidth] = useState(0);
+  const scrollbarTrackRef = useRef<HTMLDivElement>(null);
+  const scrollbarDragRef = useRef<{
+    mode: 'pan' | 'left' | 'right';
+    startX: number;
+    startScrollLeft: number;
+    startPixelsPerSecond: number;
+  } | null>(null);
+  // Anchor the visible left/right edge time during a zoom drag so the edge
+  // the user isn't dragging stays pinned in place across pixelsPerSecond changes.
+  const zoomAnchorRef = useRef<{ type: 'left' | 'right'; timeMs: number } | null>(null);
+
+  // Mirror the timeline's scrollLeft into state so the scrollbar thumb tracks it
+  useEffect(() => {
+    const el = tracksRef.current;
+    if (!el) return;
+    const onScroll = () => setTimelineScrollLeft(el.scrollLeft);
+    el.addEventListener('scroll', onScroll);
+    setTimelineScrollLeft(el.scrollLeft);
+    return () => el.removeEventListener('scroll', onScroll);
+  }, []);
+
+  // Track scrollbar track width for thumb sizing
+  useEffect(() => {
+    const el = scrollbarTrackRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        setScrollbarTrackWidth(entry.contentRect.width);
+      }
+    });
+    ro.observe(el);
+    setScrollbarTrackWidth(el.clientWidth);
+    return () => ro.disconnect();
+  }, []);
+
   // Calculate effective duration (accounting for trims)
   const getEffectiveDuration = (item: StoryItemDetail) => {
     return item.duration * 1000 - (item.trim_start_ms || 0) - (item.trim_end_ms || 0);
@@ -234,6 +442,41 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
     if (items.length === 0) return 10000; // Default 10 seconds
     return Math.max(...items.map((item) => item.start_time_ms + getEffectiveDuration(item)), 10000);
   }, [items, getEffectiveDuration]);
+
+  // Zoom bounds are framed in seconds-of-timeline-visible-at-once (the
+  // "scope") rather than abstract pixels-per-second so the bar reflects
+  // something meaningful: fully zoomed out shows the entire project, fully
+  // zoomed in shows MIN_VISIBLE_SECONDS. Convert to pixels using the visible
+  // track area (container minus the sticky label column).
+  const visibleTrackWidth = Math.max(0, containerWidth - LABEL_COL_WIDTH);
+  const projectSeconds = totalDurationMs / 1000;
+  const { minPps, maxPps } = useMemo(() => {
+    if (visibleTrackWidth <= 0 || projectSeconds <= 0) {
+      return { minPps: 10, maxPps: 200 };
+    }
+    const min = visibleTrackWidth / projectSeconds;
+    const max = visibleTrackWidth / MIN_VISIBLE_SECONDS;
+    // For projects shorter than MIN_VISIBLE_SECONDS the entire bar collapses
+    // to one point; clamp so the range stays non-inverted.
+    return { minPps: min, maxPps: Math.max(max, min) };
+  }, [visibleTrackWidth, projectSeconds]);
+
+  // Apply the default scope (60 s, or the whole project if shorter) once we
+  // have a real measurement to convert it into pixels-per-second.
+  useEffect(() => {
+    if (hasAppliedDefaultZoomRef.current) return;
+    if (visibleTrackWidth <= 0) return;
+    const defaultScope = Math.min(DEFAULT_VISIBLE_SECONDS, Math.max(projectSeconds, MIN_VISIBLE_SECONDS));
+    setPixelsPerSecond(visibleTrackWidth / defaultScope);
+    hasAppliedDefaultZoomRef.current = true;
+  }, [visibleTrackWidth, projectSeconds]);
+
+  // Re-clamp the current zoom whenever the bounds shift (project length
+  // changed, window resized) so the user can't end up parked outside the
+  // valid range from a previous session.
+  useEffect(() => {
+    setPixelsPerSecond((prev) => Math.max(minPps, Math.min(maxPps, prev)));
+  }, [minPps, maxPps]);
 
   // Calculate timeline width - at least full container width
   const contentWidth = (totalDurationMs / 1000) * pixelsPerSecond + 200; // Content width with padding
@@ -266,11 +509,11 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
   const pixelsToMs = useCallback((px: number) => (px / pixelsPerSecond) * 1000, [pixelsPerSecond]);
 
   const handleZoomIn = () => {
-    setPixelsPerSecond((prev) => Math.min(prev * 1.5, MAX_PIXELS_PER_SECOND));
+    setPixelsPerSecond((prev) => Math.min(prev * 1.5, maxPps));
   };
 
   const handleZoomOut = () => {
-    setPixelsPerSecond((prev) => Math.max(prev / 1.5, MIN_PIXELS_PER_SECOND));
+    setPixelsPerSecond((prev) => Math.max(prev / 1.5, minPps));
   };
 
   // Resize handlers
@@ -313,10 +556,10 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
     }
   }, [isResizing, handleResizeMove, handleResizeEnd]);
 
-  const handleTimelineClick = (e: React.MouseEvent<HTMLDivElement>) => {
+  const handleTimelineClick = (e: React.MouseEvent<HTMLElement>) => {
     if (!tracksRef.current || draggingItem || trimmingItem) return;
     const rect = tracksRef.current.getBoundingClientRect();
-    const x = e.clientX - rect.left + tracksRef.current.scrollLeft;
+    const x = e.clientX - rect.left + tracksRef.current.scrollLeft - LABEL_COL_WIDTH;
     const timeMs = Math.max(0, pixelsToMs(x));
     seek(timeMs);
     // Deselect clip when clicking on timeline
@@ -442,12 +685,15 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
   }, [trimmingItem, trimSide, tempTrimValues, storyId, trimItem, toast]);
 
   const handleSplit = useCallback(() => {
-    if (!selectedClipId) return;
+    if (!selectedClipId || splitItem.isPending) return;
 
     const item = items.find((i) => i.id === selectedClipId);
     if (!item) return;
 
-    const splitTimeMs = currentTimeMs - item.start_time_ms;
+    // currentTimeMs is driven by audio playback and arrives as a float;
+    // the backend's StoryItemSplit.split_time_ms is `int`, so round before
+    // sending or pydantic rejects the request.
+    const splitTimeMs = Math.round(currentTimeMs - item.start_time_ms);
     const effectiveDuration = getEffectiveDuration(item);
 
     if (splitTimeMs <= 0 || splitTimeMs >= effectiveDuration) {
@@ -532,6 +778,20 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
     );
   }, [selectedClipId, storyId, removeItem, toast, setSelectedClipId]);
 
+  const handleRegenerate = useCallback(async () => {
+    if (!selectedItem) return;
+    try {
+      await apiClient.regenerateGeneration(selectedItem.generation_id);
+      addPendingGeneration(selectedItem.generation_id);
+    } catch (error) {
+      toast({
+        title: 'Failed to regenerate',
+        description: error instanceof Error ? error.message : String(error),
+        variant: 'destructive',
+      });
+    }
+  }, [selectedItem, addPendingGeneration, toast]);
+
   // Keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -596,7 +856,13 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
       y: e.clientY - rect.top,
     });
     setDragPosition({
-      x: rect.left - tracksRef.current.getBoundingClientRect().left + tracksRef.current.scrollLeft,
+      // Subtract label column width because clips live in a sub-container offset
+      // by LABEL_COL_WIDTH, so dragPosition.x is stored in timeline-local coords.
+      x:
+        rect.left -
+        tracksRef.current.getBoundingClientRect().left +
+        tracksRef.current.scrollLeft -
+        LABEL_COL_WIDTH,
       // Subtract ruler height since clips are positioned relative to tracks area, not the scrollable container
       y: rect.top - tracksRef.current.getBoundingClientRect().top - TIME_RULER_HEIGHT,
     });
@@ -608,7 +874,12 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
       if (!draggingItem || !tracksRef.current) return;
 
       const rect = tracksRef.current.getBoundingClientRect();
-      const x = e.clientX - rect.left + tracksRef.current.scrollLeft - dragOffset.x;
+      const x =
+        e.clientX -
+        rect.left +
+        tracksRef.current.scrollLeft -
+        dragOffset.x -
+        LABEL_COL_WIDTH;
       // Subtract ruler height since clips are positioned relative to tracks area
       const y = e.clientY - rect.top - dragOffset.y - TIME_RULER_HEIGHT;
 
@@ -704,7 +975,106 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
 
   // Calculate tracks area height
   const tracksAreaHeight = tracks.length * TRACK_HEIGHT;
-  const timelineContainerHeight = editorHeight - 40; // Subtract toolbar height
+  const timelineContainerHeight = editorHeight - 40 - SCRUB_BAR_HEIGHT;
+
+  // Scrollbar thumb geometry
+  const maxTimelineScroll = Math.max(0, timelineWidth - containerWidth);
+  const visibleRatio = timelineWidth > 0 ? Math.min(1, containerWidth / timelineWidth) : 1;
+  const thumbWidth = Math.max(24, visibleRatio * scrollbarTrackWidth);
+  const thumbRange = Math.max(0, scrollbarTrackWidth - thumbWidth);
+  const thumbLeft =
+    maxTimelineScroll > 0 && thumbRange > 0
+      ? (timelineScrollLeft / maxTimelineScroll) * thumbRange
+      : 0;
+  const canScrollHorizontally = maxTimelineScroll > 0;
+
+  const handleScrollbarMouseDown = useCallback(
+    (mode: 'pan' | 'left' | 'right') => (e: React.MouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      scrollbarDragRef.current = {
+        mode,
+        startX: e.clientX,
+        startScrollLeft: timelineScrollLeft,
+        startPixelsPerSecond: pixelsPerSecond,
+      };
+    },
+    [timelineScrollLeft, pixelsPerSecond],
+  );
+
+  // After a zoom drag updates pixelsPerSecond, snap scrollLeft so the anchored
+  // edge (left or right of the visible window) stays at the same time.
+  useEffect(() => {
+    const anchor = zoomAnchorRef.current;
+    if (!anchor || !tracksRef.current) return;
+    const timePx = (anchor.timeMs / 1000) * pixelsPerSecond;
+    tracksRef.current.scrollLeft =
+      anchor.type === 'left' ? Math.max(0, timePx) : Math.max(0, timePx - containerWidth);
+  }, [pixelsPerSecond, containerWidth]);
+
+  useEffect(() => {
+    const onMouseMove = (e: MouseEvent) => {
+      const drag = scrollbarDragRef.current;
+      if (!drag || !tracksRef.current) return;
+      const deltaX = e.clientX - drag.startX;
+
+      if (drag.mode === 'pan') {
+        if (thumbRange <= 0) return;
+        const deltaScroll = (deltaX / thumbRange) * maxTimelineScroll;
+        tracksRef.current.scrollLeft = Math.max(
+          0,
+          Math.min(maxTimelineScroll, drag.startScrollLeft + deltaScroll),
+        );
+        return;
+      }
+
+      if (scrollbarTrackWidth <= 0 || containerWidth <= 0) return;
+
+      // Recompute the thumb width that corresponded to the drag start, then
+      // apply the mouse delta to the dragged edge.
+      const startTimelinePx =
+        (totalDurationMs / 1000) * drag.startPixelsPerSecond + 200;
+      const startThumbWidth = Math.max(
+        30,
+        Math.min(scrollbarTrackWidth, (containerWidth / startTimelinePx) * scrollbarTrackWidth),
+      );
+      const newThumbWidth = Math.max(
+        30,
+        Math.min(
+          scrollbarTrackWidth,
+          drag.mode === 'right' ? startThumbWidth + deltaX : startThumbWidth - deltaX,
+        ),
+      );
+
+      const newTimelinePx = (containerWidth / newThumbWidth) * scrollbarTrackWidth;
+      const rawPps = (newTimelinePx - 200) / (totalDurationMs / 1000);
+      const newPps = Math.max(minPps, Math.min(maxPps, rawPps));
+
+      zoomAnchorRef.current =
+        drag.mode === 'right'
+          ? {
+              type: 'left',
+              timeMs: (drag.startScrollLeft / drag.startPixelsPerSecond) * 1000,
+            }
+          : {
+              type: 'right',
+              timeMs:
+                ((drag.startScrollLeft + containerWidth) / drag.startPixelsPerSecond) * 1000,
+            };
+
+      setPixelsPerSecond(newPps);
+    };
+    const onMouseUp = () => {
+      scrollbarDragRef.current = null;
+      zoomAnchorRef.current = null;
+    };
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+  }, [maxTimelineScroll, thumbRange, scrollbarTrackWidth, containerWidth, totalDurationMs, minPps, maxPps]);
 
   if (items.length === 0) {
     return null;
@@ -736,6 +1106,7 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
               className="h-7 w-7"
               onClick={handlePlayPause}
               title="Play/Pause (Space)"
+              aria-label={isCurrentlyPlaying ? 'Pause' : 'Play'}
             >
               {isCurrentlyPlaying ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
             </Button>
@@ -745,6 +1116,7 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
               className="h-7 w-7"
               onClick={handleStop}
               disabled={!isCurrentlyPlaying}
+              aria-label="Stop"
             >
               <Square className="h-3 w-3" />
             </Button>
@@ -762,6 +1134,7 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
                 className="h-7 w-7"
                 onClick={handleSplit}
                 title="Split at playhead (S)"
+                aria-label="Split at playhead"
               >
                 <Scissors className="h-4 w-4" />
               </Button>
@@ -771,71 +1144,146 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
                 className="h-7 w-7"
                 onClick={handleDuplicate}
                 title="Duplicate (Cmd/Ctrl+D)"
+                aria-label="Duplicate clip"
               >
                 <Copy className="h-4 w-4" />
               </Button>
+              {selectedItem && (
+                <ClipVolumePopover
+                  storyId={storyId}
+                  itemId={selectedItem.id}
+                  volume={selectedItem.volume}
+                  onChange={(value) =>
+                    updateVolume.mutate(
+                      {
+                        storyId,
+                        itemId: selectedItem.id,
+                        data: { volume: value },
+                      },
+                      {
+                        onError: (error) => {
+                          toast({
+                            title: 'Failed to update volume',
+                            description: error instanceof Error ? error.message : String(error),
+                            variant: 'destructive',
+                          });
+                        },
+                      },
+                    )
+                  }
+                />
+              )}
               <Button
                 variant="ghost"
                 size="icon"
                 className="h-7 w-7"
                 onClick={handleDelete}
                 title="Delete (Delete/Backspace)"
+                aria-label="Delete clip"
               >
                 <Trash2 className="h-4 w-4" />
               </Button>
+              {selectedItem?.engine !== 'import' && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7"
+                  onClick={handleRegenerate}
+                  title="Regenerate"
+                  aria-label="Regenerate clip"
+                >
+                  <RotateCcw className="h-4 w-4" />
+                </Button>
+              )}
+              {hasMultipleVersions && (
+                <>
+                  <div className="w-px h-4 bg-border mx-1" />
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        variant="ghost"
+                        className="h-7 gap-1.5 px-2 text-xs"
+                        title="Change version/take"
+                      >
+                        <GalleryVerticalEnd className="h-3.5 w-3.5" />
+                        <span className="max-w-[80px] truncate">
+                          {activeVersionLabel ?? 'default'}
+                        </span>
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="center" className="min-w-[160px]">
+                      {selectedItemVersions.map((version) => {
+                        const isActive = selectedItem?.version_id
+                          ? version.id === selectedItem.version_id
+                          : version.is_default;
+                        return (
+                          <DropdownMenuItem
+                            key={version.id}
+                            onClick={() => handleSetVersion(version.id)}
+                            className="gap-2 text-xs"
+                          >
+                            <Check
+                              className={cn('h-3 w-3', isActive ? 'opacity-100' : 'opacity-0')}
+                            />
+                            <span className="truncate">{version.label}</span>
+                            {version.effects_chain && version.effects_chain.length > 0 && (
+                              <span className="text-muted-foreground ml-auto text-[10px]">
+                                {version.effects_chain.length} fx
+                              </span>
+                            )}
+                          </DropdownMenuItem>
+                        );
+                      })}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </>
+              )}
             </div>
           )}
 
           {/* Zoom controls - right side */}
           <div className="flex items-center gap-2">
             <span className="text-xs text-muted-foreground">Zoom:</span>
-            <Button variant="ghost" size="icon" className="h-6 w-6" onClick={handleZoomOut}>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-6 w-6"
+              onClick={handleZoomOut}
+              aria-label="Zoom out"
+            >
               <Minus className="h-3 w-3" />
             </Button>
-            <Button variant="ghost" size="icon" className="h-6 w-6" onClick={handleZoomIn}>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-6 w-6"
+              onClick={handleZoomIn}
+              aria-label="Zoom in"
+            >
               <Plus className="h-3 w-3" />
             </Button>
           </div>
         </div>
 
-        {/* Timeline container with track labels sidebar */}
-        <div className="flex" style={{ height: `${timelineContainerHeight}px` }}>
-          {/* Track labels sidebar - fixed width */}
-          <div className="w-16 shrink-0 border-r bg-muted/20 overflow-hidden">
-            {/* Spacer for time ruler */}
-            <div className="h-6 border-b bg-muted/30" />
-            {/* Track labels */}
-            <div style={{ height: `${tracksAreaHeight}px` }}>
-              {tracks.map((trackNumber, index) => (
-                <div
-                  key={trackNumber}
-                  className={cn(
-                    'border-b flex items-center justify-center',
-                    index % 2 === 0 ? 'bg-background' : 'bg-muted/10',
-                  )}
-                  style={{ height: `${TRACK_HEIGHT}px` }}
-                >
-                  <span className="text-[10px] text-muted-foreground select-none">
-                    {trackNumber}
-                  </span>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* Scrollable timeline area */}
-          {/* biome-ignore lint/a11y/noStaticElementInteractions: Container handles drag events for child clips */}
+        {/* Timeline scroll container */}
+        {/* biome-ignore lint/a11y/noStaticElementInteractions: Container handles drag events for child clips */}
+        <div
+          ref={tracksRef}
+          className="overflow-auto relative"
+          style={{ height: `${timelineContainerHeight}px` }}
+          onMouseMove={draggingItem ? handleDragMove : undefined}
+          onMouseUp={draggingItem ? handleDragEnd : undefined}
+          onMouseLeave={draggingItem ? handleDragEnd : undefined}
+        >
+          {/* Ruler row: corner spacer + time ruler, sticky to top */}
           <div
-            ref={tracksRef}
-            className="overflow-auto relative flex-1"
-            onMouseMove={draggingItem ? handleDragMove : undefined}
-            onMouseUp={draggingItem ? handleDragEnd : undefined}
-            onMouseLeave={draggingItem ? handleDragEnd : undefined}
+            className="flex sticky top-0 z-30"
+            style={{ width: `${timelineWidth + LABEL_COL_WIDTH}px` }}
           >
-            {/* Time ruler - clickable to seek */}
+            <div className="w-16 h-6 shrink-0 border-b border-r bg-muted/30 sticky left-0 z-40" />
             <button
               type="button"
-              className="h-6 border-b bg-muted/20 sticky top-0 z-10 cursor-pointer text-left"
+              className="h-6 border-b bg-muted/20 cursor-pointer text-left relative"
               style={{ width: `${timelineWidth}px` }}
               onClick={handleTimelineClick}
               aria-label="Seek timeline"
@@ -853,27 +1301,72 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
                 </div>
               ))}
             </button>
+          </div>
 
-            {/* Tracks area */}
-            <div
-              className="relative"
-              style={{ width: `${timelineWidth}px`, height: `${tracksAreaHeight}px` }}
-            >
-              {/* Track backgrounds - pointer-events-none to allow clicks to pass through */}
-              {tracks.map((trackNumber, index) => (
+          {/* Tracks area (rows with sticky labels + clips sub-container) */}
+          <div
+            className="relative"
+            style={{
+              width: `${timelineWidth + LABEL_COL_WIDTH}px`,
+              height: `${tracksAreaHeight}px`,
+            }}
+          >
+            {/* Per-track rows: label and background as flex siblings guarantee alignment */}
+            {tracks.map((trackNumber, index) => {
+              const isFirst = index === 0;
+              const isLast = index === tracks.length - 1;
+              return (
                 <div
                   key={trackNumber}
-                  className={cn(
-                    'absolute left-0 right-0 border-b pointer-events-none',
-                    index % 2 === 0 ? 'bg-background' : 'bg-muted/10',
-                  )}
+                  className="absolute left-0 right-0 flex"
                   style={{
                     top: `${index * TRACK_HEIGHT}px`,
                     height: `${TRACK_HEIGHT}px`,
                   }}
-                />
-              ))}
+                >
+                  <div className="w-16 shrink-0 border-b border-r flex items-center justify-center sticky left-0 z-20 h-full bg-background">
+                    <div className="absolute inset-0 bg-muted/20 pointer-events-none" />
+                    <span className="relative text-[10px] text-muted-foreground select-none">
+                      {trackNumber}
+                    </span>
+                    {isFirst && (
+                      <button
+                        type="button"
+                        onClick={handleAddTrackAbove}
+                        title="Add track above"
+                        aria-label="Add track above"
+                        className="absolute top-0 right-0 left-0 h-3 flex items-center justify-center text-muted-foreground/50 hover:text-foreground hover:bg-muted/40 transition-colors"
+                      >
+                        <Plus className="h-2.5 w-2.5" />
+                      </button>
+                    )}
+                    {isLast && (
+                      <button
+                        type="button"
+                        onClick={handleAddTrackBelow}
+                        title="Add track below"
+                        aria-label="Add track below"
+                        className="absolute bottom-0 right-0 left-0 h-3 flex items-center justify-center text-muted-foreground/50 hover:text-foreground hover:bg-muted/40 transition-colors"
+                      >
+                        <Plus className="h-2.5 w-2.5" />
+                      </button>
+                    )}
+                  </div>
+                  <div
+                    className={cn(
+                      'border-b flex-1 pointer-events-none',
+                      index % 2 === 0 ? 'bg-background' : 'bg-muted/10',
+                    )}
+                  />
+                </div>
+              );
+            })}
 
+            {/* Clip/playhead/seek layer offset past the label column */}
+            <div
+              className="absolute top-0 bottom-0"
+              style={{ left: `${LABEL_COL_WIDTH}px`, width: `${timelineWidth}px` }}
+            >
               {/* Click area for seeking - z-index lower than clips */}
               <button
                 type="button"
@@ -934,13 +1427,14 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
                       {/* Clip label */}
                       <div className="absolute top-0 left-1 right-1 z-10">
                         <p className="text-[9px] font-medium text-accent-foreground truncate">
-                          {item.profile_name}
+                          {item.engine === 'import' ? item.text : item.profile_name}
                         </p>
                       </div>
                       {/* Waveform */}
                       <div className="absolute inset-0 top-3">
                         <ClipWaveform
                           generationId={item.generation_id}
+                          versionId={item.version_id}
                           width={clipWidth}
                           trimStartMs={displayTrimStart}
                           trimEndMs={displayTrimEnd}
@@ -979,6 +1473,55 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
               >
                 <div className="absolute -top-1 left-1/2 -translate-x-1/2 w-3 h-3 bg-accent rounded-full" />
               </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Horizontal timeline scrollbar + zoom handles */}
+        <div
+          className="flex border-t bg-background/40"
+          style={{ height: `${SCRUB_BAR_HEIGHT}px` }}
+        >
+          <div className="w-16 shrink-0 border-r" />
+          <div
+            ref={scrollbarTrackRef}
+            className="relative flex-1 overflow-hidden select-none px-1"
+          >
+            <div
+              className="absolute top-1 bottom-1 bg-foreground/10 hover:bg-foreground/15 transition-colors group rounded-full"
+              style={{ width: `${thumbWidth}px`, left: `${thumbLeft}px` }}
+            >
+              {/* Left zoom handle */}
+              {/* biome-ignore lint/a11y/noStaticElementInteractions: mouse-driven edge handle */}
+              <div
+                role="slider"
+                aria-label="Zoom from left edge"
+                aria-valuenow={Math.round(pixelsPerSecond)}
+                aria-valuemin={Math.round(minPps)}
+                aria-valuemax={Math.round(maxPps)}
+                className="absolute top-0 bottom-0 left-0 w-1.5 cursor-ew-resize bg-foreground/25 hover:bg-foreground/40 transition-colors rounded-l-full"
+                onMouseDown={handleScrollbarMouseDown('left')}
+              />
+              {/* Pan area */}
+              {/* biome-ignore lint/a11y/noStaticElementInteractions: mouse-driven drag area */}
+              <div
+                className={cn(
+                  'absolute top-0 bottom-0 left-1.5 right-1.5',
+                  canScrollHorizontally ? 'cursor-grab active:cursor-grabbing' : 'cursor-default',
+                )}
+                onMouseDown={canScrollHorizontally ? handleScrollbarMouseDown('pan') : undefined}
+              />
+              {/* Right zoom handle */}
+              {/* biome-ignore lint/a11y/noStaticElementInteractions: mouse-driven edge handle */}
+              <div
+                role="slider"
+                aria-label="Zoom from right edge"
+                aria-valuenow={Math.round(pixelsPerSecond)}
+                aria-valuemin={Math.round(minPps)}
+                aria-valuemax={Math.round(maxPps)}
+                className="absolute top-0 bottom-0 right-0 w-1.5 cursor-ew-resize bg-foreground/25 hover:bg-foreground/40 transition-colors rounded-r-full"
+                onMouseDown={handleScrollbarMouseDown('right')}
+              />
             </div>
           </div>
         </div>

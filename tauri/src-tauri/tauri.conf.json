@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Voicebox",
-  "version": "0.1.12",
+  "version": "0.5.0",
   "identifier": "sh.voicebox.app",
   "build": {
     "beforeDevCommand": "bun run dev",
@@ -12,8 +12,8 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "createUpdaterArtifacts": true,
-    "externalBin": ["binaries/voicebox-server"],
+    "createUpdaterArtifacts": "v1Compatible",
+    "externalBin": ["binaries/voicebox-server", "binaries/voicebox-mcp"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -34,6 +34,7 @@
     }
   },
   "app": {
+    "macOSPrivateApi": true,
     "security": {
       "csp": null,
       "capabilities": ["default"]
@@ -56,7 +57,7 @@
   },
   "plugins": {
     "shell": {
-      "open": true
+      "open": ".*"
     },
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEUxRENBQkRBQjdBNTM1OTIKUldTU05hVzMycXZjNGJGcUxmcVVocll2QjdSaTJNdlFxR2M3VDJsMnVvbDdyZGRPMmRlOW9aWTcK",

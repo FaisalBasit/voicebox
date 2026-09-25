@@ -67,11 +67,33 @@ class TaskManager:
     def get_active_downloads(self) -> List[DownloadTask]:
         """Get all active downloads."""
         return list(self._active_downloads.values())
+
+    def get_pending_downloads(self) -> List[DownloadTask]:
+        """Get downloads that are still in flight.
+
+        Excludes errored tasks, which stay in the active list so the
+        error/retry UI can show them but must not be reported as
+        "downloading" by /models/status.
+        """
+        return [
+            task
+            for task in self._active_downloads.values()
+            if task.status in ("downloading", "extracting")
+        ]
     
     def get_active_generations(self) -> List[GenerationTask]:
         """Get all active generations."""
         return list(self._active_generations.values())
     
+    def cancel_download(self, model_name: str) -> bool:
+        """Cancel/dismiss a download task (removes it from active list)."""
+        return self._active_downloads.pop(model_name, None) is not None
+
+    def clear_all(self) -> None:
+        """Clear all download and generation tasks."""
+        self._active_downloads.clear()
+        self._active_generations.clear()
+
     def is_download_active(self, model_name: str) -> bool:
         """Check if a download is active."""
         return model_name in self._active_downloads

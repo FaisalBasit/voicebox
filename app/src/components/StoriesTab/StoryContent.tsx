@@ -13,12 +13,17 @@ import {
   sortableKeyboardCoordinates,
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable';
-import { Download, Plus } from 'lucide-react';
+import { Link } from '@tanstack/react-router';
+import { AnimatePresence, motion } from 'framer-motion';
+import { Download, Music, Plus, Upload } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import Loader from 'react-loaders';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { useToast } from '@/components/ui/use-toast';
+import { apiClient } from '@/lib/api/client';
 import { useHistory } from '@/lib/hooks/useHistory';
 import {
   useAddStoryItem,
@@ -28,10 +33,12 @@ import {
   useStory,
 } from '@/lib/hooks/useStories';
 import { useStoryPlayback } from '@/lib/hooks/useStoryPlayback';
+import { useGenerationStore } from '@/stores/generationStore';
 import { useStoryStore } from '@/stores/storyStore';
 import { SortableStoryChatItem } from './StoryChatItem';
 
 export function StoryContent() {
+  const { t } = useTranslation();
   const selectedStoryId = useStoryStore((state) => state.selectedStoryId);
   const { data: story, isLoading } = useStory(selectedStoryId);
   const removeItem = useRemoveStoryItem();
@@ -40,6 +47,12 @@ export function StoryContent() {
   const addStoryItem = useAddStoryItem();
   const { toast } = useToast();
   const scrollRef = useRef<HTMLDivElement>(null);
+  const importInputRef = useRef<HTMLInputElement>(null);
+  const pendingCount = useGenerationStore((s) => s.pendingGenerationIds.size);
+  const addPendingGeneration = useGenerationStore((s) => s.addPendingGeneration);
+  const [isDraggingFile, setIsDraggingFile] = useState(false);
+  const [isImporting, setIsImporting] = useState(false);
+  const dragDepthRef = useRef(0);
 
   // Add generation popover state
   const [searchQuery, setSearchQuery] = useState('');
@@ -53,9 +66,9 @@ export function StoryContent() {
     const query = searchQuery.toLowerCase();
     return historyData.items.filter(
       (gen) =>
+        gen.status === 'completed' &&
         !storyGenerationIds.has(gen.id) &&
-        (gen.text.toLowerCase().includes(query) ||
-          gen.profile_name.toLowerCase().includes(query)),
+        (gen.text.toLowerCase().includes(query) || gen.profile_name.toLowerCase().includes(query)),
     );
   }, [historyData, story, searchQuery]);
 
@@ -65,8 +78,12 @@ export function StoryContent() {
   // Track editor is shown when story has items
   const hasBottomBar = story && story.items.length > 0;
 
-  // Calculate dynamic bottom padding: track editor + gap
-  const bottomPadding = hasBottomBar ? trackEditorHeight + 24 : 0;
+  // Clear the floating generate box (always visible on this route) and the
+  // track editor bar when it's showing.
+  const FLOATING_BOX_CLEARANCE = 140;
+  const bottomPadding = hasBottomBar
+    ? trackEditorHeight + FLOATING_BOX_CLEARANCE
+    : FLOATING_BOX_CLEARANCE;
 
   // Drag and drop sensors
   const sensors = useSensors(
@@ -131,6 +148,19 @@ export function StoryContent() {
     }
   }, [isPlaying]);
 
+  const handleRegenerate = async (generationId: string) => {
+    try {
+      await apiClient.regenerateGeneration(generationId);
+      addPendingGeneration(generationId);
+    } catch (error) {
+      toast({
+        title: t('storyContent.toast.regenerateFailed'),
+        description: error instanceof Error ? error.message : String(error),
+        variant: 'destructive',
+      });
+    }
+  };
+
   const handleRemoveItem = (itemId: string) => {
     if (!story) return;
 
@@ -142,7 +172,7 @@ export function StoryContent() {
       {
         onError: (error) => {
           toast({
-            title: 'Failed to remove item',
+            title: t('storyContent.toast.removeFailed'),
             description: error.message,
             variant: 'destructive',
           });
@@ -174,7 +204,7 @@ export function StoryContent() {
       {
         onError: (error) => {
           toast({
-            title: 'Failed to reorder items',
+            title: t('storyContent.toast.reorderFailed'),
             description: error.message,
             variant: 'destructive',
           });
@@ -194,13 +224,40 @@ export function StoryContent() {
       {
         onError: (error) => {
           toast({
-            title: 'Failed to export audio',
+            title: t('storyContent.toast.exportFailed'),
             description: error.message,
             variant: 'destructive',
           });
         },
       },
     );
+  };
+
+  const handleImportAudio = async (file: File) => {
+    if (!story) return;
+    setIsImporting(true);
+    try {
+      const generation = await apiClient.importAudio(file);
+      await addStoryItem.mutateAsync({
+        storyId: story.id,
+        data: { generation_id: generation.id },
+      });
+      setIsAddOpen(false);
+    } catch (error) {
+      toast({
+        title: t('storyContent.toast.importFailed'),
+        description: error instanceof Error ? error.message : String(error),
+        variant: 'destructive',
+      });
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
+  const handleImportFiles = async (files: FileList | File[]) => {
+    for (const file of Array.from(files)) {
+      await handleImportAudio(file);
+    }
   };
 
   const handleAddGeneration = (generationId: string) => {
@@ -218,7 +275,7 @@ export function StoryContent() {
         },
         onError: (error) => {
           toast({
-            title: 'Failed to add generation',
+            title: t('storyContent.toast.addFailed'),
             description: error.message,
             variant: 'destructive',
           });
@@ -231,8 +288,8 @@ export function StoryContent() {
     return (
       <div className="flex items-center justify-center h-full text-muted-foreground">
         <div className="text-center">
-          <p className="text-lg font-medium mb-2">Select a story</p>
-          <p className="text-sm">Choose a story from the list to view its content</p>
+          <p className="text-lg font-medium mb-2">{t('storyContent.selectStory.title')}</p>
+          <p className="text-sm">{t('storyContent.selectStory.hint')}</p>
         </div>
       </div>
     );
@@ -241,7 +298,7 @@ export function StoryContent() {
   if (isLoading) {
     return (
       <div className="flex items-center justify-center h-full">
-        <div className="text-muted-foreground">Loading story...</div>
+        <div className="text-muted-foreground">{t('storyContent.loading')}</div>
       </div>
     );
   }
@@ -250,46 +307,125 @@ export function StoryContent() {
     return (
       <div className="flex items-center justify-center h-full text-muted-foreground">
         <div className="text-center">
-          <p className="text-lg font-medium mb-2">Story not found</p>
-          <p className="text-sm">The selected story could not be loaded</p>
+          <p className="text-lg font-medium mb-2">{t('storyContent.notFound.title')}</p>
+          <p className="text-sm">{t('storyContent.notFound.hint')}</p>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="flex flex-col h-full min-h-0">
+    <div
+      className="flex flex-col h-full min-h-0 relative overflow-hidden"
+      onDragEnter={(e) => {
+        if (!e.dataTransfer?.types.includes('Files')) return;
+        e.preventDefault();
+        dragDepthRef.current += 1;
+        setIsDraggingFile(true);
+      }}
+      onDragOver={(e) => {
+        if (e.dataTransfer?.types.includes('Files')) e.preventDefault();
+      }}
+      onDragLeave={(e) => {
+        if (!e.dataTransfer?.types.includes('Files')) return;
+        dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+        if (dragDepthRef.current === 0) setIsDraggingFile(false);
+      }}
+      onDrop={(e) => {
+        if (!e.dataTransfer?.files?.length) return;
+        e.preventDefault();
+        dragDepthRef.current = 0;
+        setIsDraggingFile(false);
+        handleImportFiles(e.dataTransfer.files);
+      }}
+    >
+      <input
+        ref={importInputRef}
+        type="file"
+        accept="audio/*,.wav,.mp3,.flac,.ogg,.m4a,.aac,.webm"
+        multiple
+        className="hidden"
+        onChange={(e) => {
+          if (e.target.files?.length) handleImportFiles(e.target.files);
+          e.target.value = '';
+        }}
+      />
+      {isDraggingFile && (
+        <div className="absolute inset-0 z-30 pointer-events-none flex items-center justify-center bg-accent/10 border-2 border-dashed border-accent rounded-lg m-4">
+          <div className="flex flex-col items-center gap-2 text-accent">
+            <Music className="h-8 w-8" />
+            <span className="text-sm font-medium">{t('storyContent.dropToImport')}</span>
+          </div>
+        </div>
+      )}
+      {/* Scroll Mask */}
+      <div className="absolute top-0 left-0 right-0 h-20 bg-gradient-to-b from-background to-transparent z-10 pointer-events-none" />
+
       {/* Header */}
-      <div className="flex items-center justify-between mb-4 px-1">
+      <div className="absolute top-0 left-0 right-0 z-20 flex items-center justify-between px-1">
         <div>
           <h2 className="text-2xl font-bold">{story.name}</h2>
           {story.description && (
             <p className="text-sm text-muted-foreground mt-1">{story.description}</p>
           )}
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2 items-center">
+          <AnimatePresence>
+            {pendingCount > 0 && (
+              <motion.div
+                initial={{ opacity: 0, scale: 0.9, width: 0 }}
+                animate={{ opacity: 1, scale: 1, width: 'auto' }}
+                exit={{ opacity: 0, scale: 0.9, width: 0 }}
+                transition={{ duration: 0.2 }}
+              >
+                <Link
+                  to="/"
+                  className="flex items-center gap-2 h-8 pl-1.5 pr-3 rounded-full bg-card border border-border hover:bg-muted/50 transition-all duration-200 cursor-pointer"
+                >
+                  <div className="shrink-0 w-10 h-5 overflow-hidden flex items-center justify-center">
+                    <div className="scale-[0.45]">
+                      <Loader type="line-scale" active />
+                    </div>
+                  </div>
+                  <span className="text-xs text-muted-foreground whitespace-nowrap">
+                    {t('storyContent.generatingCount', { count: pendingCount })}
+                  </span>
+                </Link>
+              </motion.div>
+            )}
+          </AnimatePresence>
           <Popover open={isAddOpen} onOpenChange={setIsAddOpen}>
             <PopoverTrigger asChild>
               <Button variant="outline" size="sm">
                 <Plus className="mr-2 h-4 w-4" />
-                Add
+                {t('storyContent.add')}
               </Button>
             </PopoverTrigger>
             <PopoverContent className="w-80 p-0" align="end">
-              <div className="p-2 border-b">
+              <div className="p-2 border-b space-y-2">
                 <Input
-                  placeholder="Search by name or transcript..."
+                  placeholder={t('storyContent.searchPlaceholder')}
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   autoFocus
                 />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="w-full justify-start"
+                  onClick={() => importInputRef.current?.click()}
+                  disabled={isImporting}
+                >
+                  <Upload className="mr-2 h-4 w-4" />
+                  {isImporting ? t('storyContent.importing') : t('storyContent.importAudio')}
+                </Button>
               </div>
               <div className="max-h-60 overflow-y-auto">
                 {availableGenerations.length === 0 ? (
                   <div className="p-4 text-center text-sm text-muted-foreground">
                     {searchQuery
-                      ? 'No matching generations found'
-                      : 'No available generations'}
+                      ? t('storyContent.searchNoMatches')
+                      : t('storyContent.searchNoAvailable')}
                   </div>
                 ) : (
                   availableGenerations.map((gen) => (
@@ -317,7 +453,7 @@ export function StoryContent() {
               disabled={exportAudio.isPending}
             >
               <Download className="mr-2 h-4 w-4" />
-              Export Audio
+              {t('storyContent.exportAudio')}
             </Button>
           )}
         </div>
@@ -326,13 +462,13 @@ export function StoryContent() {
       {/* Content */}
       <div
         ref={scrollRef}
-        className="flex-1 min-h-0 overflow-y-auto space-y-3"
+        className="flex-1 min-h-0 overflow-y-auto space-y-3 pt-16 scroll-pt-16 relative z-0"
         style={{ paddingBottom: bottomPadding > 0 ? `${bottomPadding}px` : undefined }}
       >
         {sortedItems.length === 0 ? (
           <div className="text-center py-12 px-5 border-2 border-dashed border-muted rounded-md text-muted-foreground">
-            <p className="text-sm">No items in this story</p>
-            <p className="text-xs mt-2">Generate speech using the box below to add items</p>
+            <p className="text-sm">{t('storyContent.empty.title')}</p>
+            <p className="text-xs mt-2">{t('storyContent.empty.hint')}</p>
           </div>
         ) : (
           <DndContext
@@ -361,6 +497,11 @@ export function StoryContent() {
                       storyId={story.id}
                       index={index}
                       onRemove={() => handleRemoveItem(item.id)}
+                      onRegenerate={
+                        item.engine === 'import'
+                          ? undefined
+                          : () => handleRegenerate(item.generation_id)
+                      }
                       currentTimeMs={currentTimeMs}
                       isPlaying={isPlaying && playbackStoryId === story.id}
                     />

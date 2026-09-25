@@ -8,7 +8,7 @@ interface UseAudioRecordingOptions {
 }
 
 export function useAudioRecording({
-  maxDurationSeconds = 29,
+  maxDurationSeconds,
   onRecordingComplete,
 }: UseAudioRecordingOptions = {}) {
   const platform = usePlatform();
@@ -20,11 +20,13 @@ export function useAudioRecording({
   const streamRef = useRef<MediaStream | null>(null);
   const timerRef = useRef<number | null>(null);
   const startTimeRef = useRef<number | null>(null);
+  const cancelledRef = useRef<boolean>(false);
 
   const startRecording = useCallback(async () => {
     try {
       setError(null);
       chunksRef.current = [];
+      cancelledRef.current = false;
       setDuration(0);
 
       // Check if getUserMedia is available
@@ -87,31 +89,34 @@ export function useAudioRecording({
       };
 
       mediaRecorder.onstop = async () => {
+        // Snapshot the cancellation flag and recorded duration immediately —
+        // cancelRecording() clears chunks and sets cancelledRef synchronously
+        // before this async handler runs, so we must check it first.
+        const wasCancelled = cancelledRef.current;
+        const recordedDuration = startTimeRef.current
+          ? (Date.now() - startTimeRef.current) / 1000
+          : undefined;
+
         const webmBlob = new Blob(chunksRef.current, { type: 'audio/webm' });
 
-        // Convert to WAV format to avoid needing ffmpeg on backend
-        try {
-          const wavBlob = await convertToWav(webmBlob);
-
-          // Pass the actual recorded duration
-          const recordedDuration = startTimeRef.current
-            ? (Date.now() - startTimeRef.current) / 1000
-            : undefined;
-          onRecordingComplete?.(wavBlob, recordedDuration);
-        } catch (err) {
-          console.error('Error converting audio to WAV:', err);
-          // Fallback to original blob if conversion fails
-          const recordedDuration = startTimeRef.current
-            ? (Date.now() - startTimeRef.current) / 1000
-            : undefined;
-          onRecordingComplete?.(webmBlob, recordedDuration);
-        }
-
-        // Stop all tracks
+        // Stop all tracks now that we have the data
         streamRef.current?.getTracks().forEach((track) => {
           track.stop();
         });
         streamRef.current = null;
+
+        // Don't fire completion callback if the recording was cancelled
+        if (wasCancelled) return;
+
+        // Convert to WAV format to avoid needing ffmpeg on backend
+        try {
+          const wavBlob = await convertToWav(webmBlob);
+          onRecordingComplete?.(wavBlob, recordedDuration);
+        } catch (err) {
+          console.error('Error converting audio to WAV:', err);
+          // Fallback to original blob if conversion fails
+          onRecordingComplete?.(webmBlob, recordedDuration);
+        }
       };
 
       mediaRecorder.onerror = (event) => {
@@ -119,8 +124,11 @@ export function useAudioRecording({
         console.error('MediaRecorder error:', event);
       };
 
-      // Start recording
-      mediaRecorder.start(100); // Collect data every 100ms
+      // WebKit's MediaRecorder drops the WebM EBML header from chunks when
+      // started with a timeslice, so concatenated blobs fail to parse in
+      // both AudioContext and ffmpeg. Starting with no timeslice produces
+      // exactly one dataavailable on stop() with a valid container.
+      mediaRecorder.start();
       setIsRecording(true);
       startTimeRef.current = Date.now();
 
@@ -130,8 +138,11 @@ export function useAudioRecording({
           const elapsed = (Date.now() - startTimeRef.current) / 1000;
           setDuration(elapsed);
 
-          // Auto-stop at max duration
-          if (elapsed >= maxDurationSeconds) {
+          // Auto-stop at max duration when the caller opts in — dictation
+          // sessions pass undefined and run until the user releases the
+          // chord or hits stop; voice-clone sample recorders pass 29s to
+          // keep reference clips short.
+          if (maxDurationSeconds !== undefined && elapsed >= maxDurationSeconds) {
             if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
               mediaRecorderRef.current.stop();
               setIsRecording(false);
@@ -167,9 +178,10 @@ export function useAudioRecording({
 
   const cancelRecording = useCallback(() => {
     if (mediaRecorderRef.current) {
+      cancelledRef.current = true; // Must be set before stop() triggers onstop
+      chunksRef.current = [];
       mediaRecorderRef.current.stop();
       setIsRecording(false);
-      chunksRef.current = [];
       setDuration(0);
     }
 
