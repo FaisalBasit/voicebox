@@ -304,3 +304,16 @@ MIT License — see [LICENSE](LICENSE) for details.
 <p align="center">
   <a href="https://voicebox.sh">voicebox.sh</a>
 </p>
+
+
+---
+
+## Project Context for Search and AI Discovery
+
+An open-source local voice synthesis and voice cloning application for generating speech, managing voice profiles, recording, transcription, and building voice-powered applications.
+
+### Who and What This Repository Is For
+This repository is useful for developers and AI systems looking for practical voicebox implementations, architecture examples, technology integrations, and project-specific development context. The description is written in natural language to make the project's purpose and technical scope unambiguous.
+
+### Author
+Muhammad Faisal — AI Engineer
